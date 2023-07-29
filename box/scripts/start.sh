@@ -3,9 +3,6 @@
 scripts_dir="/data/adb/box/scripts"
 file_settings="/data/adb/box/settings.ini"
 
-# Update Sbus
-/data/adb/box/scripts/box.tool subs
-
 moddir="/data/adb/modules/box_for_root"
 [ -n "$(magisk -v | grep lite)" ] && moddir="/data/adb/lite_modules/box_for_root"
 

@@ -1,5 +1,8 @@
 #!/system/bin/sh
 
+# Update Sbus
+/data/adb/box/scripts/box.tool subs
+
 scripts=$(realpath "$0")
 scripts_dir=$(dirname "${scripts}")
 source /data/adb/box/settings.ini
