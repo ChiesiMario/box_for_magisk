@@ -1,0 +1,141 @@
+{
+    "dns": {
+        "queryStrategy": "UseIP",
+        "servers": [
+            "8.8.8.8"
+        ],
+        "tag": "dns",
+        "hosts": {}
+    },
+    "inbounds": [
+        {
+            "port": 5335,
+            "protocol": "dokodemo-door",
+            "tag": "proxy-in",
+            "settings": {
+                "followRedirect": true,
+                "network": "tcp,udp"
+            },
+            "sniffing": {
+                "destOverride": [
+                    "http",
+                    "tls"
+                ],
+                "enabled": true,
+                "routeOnly": false
+            },
+            "streamSettings": {
+                "sockopt": {
+                    "tproxy": "tproxy"
+                }
+            }
+        }
+    ],
+    "log": {
+        "access": "none",
+        "dnsLog": true,
+        "loglevel": "error"
+    },
+    "outbounds": [
+        {
+            "protocol": "vmess",
+            "tag": "proxy",
+            "mux": {
+                "concurrency": 8,
+                "enabled": false
+            },
+            "settings": {
+                "vnext": [
+                    {
+                        "address": "104.18.3.198",
+                        "port": 443,
+                        "users": [
+                            {
+                                "alterId": 0,
+                                "encryption": "",
+                                "id": "",
+                                "security": "auto"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "streamSettings": {
+                "network": "ws",
+                "security": "tls",
+                "tlsSettings": {
+                    "allowInsecure": true,
+                    "serverName": "u.taamarin.com"
+                },
+                "wsSettings": {
+                    "path": "/vmess",
+                    "headers": {
+                        "Host": "u.taamarin.com"
+                    }
+                }
+            }
+        },
+        {
+            "protocol": "freedom",
+            "tag": "direct",
+            "settings": {
+                "domainStrategy": "UseIP"
+            }
+        },
+        {
+            "protocol": "blackhole",
+            "tag": "block",
+            "settings": {
+                "response": {
+                    "type": "http"
+                }
+            }
+        },
+        {
+            "protocol": "dns",
+            "tag": "dns-out"
+        }
+    ],
+    "routing": {
+        "domainMatcher": "mph",
+        "domainStrategy": "IPIfNonMatch",
+        "rules": [
+            {
+                "inboundTag": [
+                    "proxy-in"
+                ],
+                "outboundTag": "dns-out",
+                "port": 53,
+                "type": "field"
+            },
+            {
+                "domain": [
+                    "regexp:^.*googlesyndication.com$",
+                    "regexp:^.*adtival\\.network$"
+                ],
+                "outboundTag": "proxy",
+                "type": "field"
+            },
+            {
+                "domain": [
+                    "geosite:youtube"
+                ],
+                "network": "udp",
+                "outboundTag": "block",
+                "type": "field"
+            },
+            {
+                "domain": [
+                    "geosite:category-ads-all"
+                ],
+                "outboundTag": "block",
+                "type": "field"
+            },
+            {
+                "network": "tcp,udp",
+                "outboundTag": "proxy",
+                "type": "field"
+            }
+        ]
+    }
+}

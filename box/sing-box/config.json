@@ -1,0 +1,98 @@
+{
+    "log": {
+        "disabled": false,
+        "timestamp": false,
+        "level": "panic"
+    },
+    "dns": {
+        "servers": [
+            {
+                "tag": "sing",
+                "address": "8.8.8.8",
+                "detour": "PROXY"
+            },
+            {
+                "tag": "rcode",
+                "address": "rcode://success"
+            }
+        ],
+        "rules": [
+            {
+                "outbound": "any",
+                "domain_suffix": [
+                    "googlesyndication.com"
+                ],
+                "domain": [
+                    "github.com"
+                ],
+                "server": "sing"
+            },
+            {
+                "geosite": "category-ads-all",
+                "server": "rcode"
+            }
+        ]
+    },
+    "inbounds": [
+        {
+            "type": "tproxy",
+            "tag": "tproxy-in",
+            "listen": "::",
+            "listen_port": 9898,
+            "sniff": true,
+            "sniff_override_destination": true
+        }
+    ],
+    "outbounds": [
+        {
+            "outbounds": [
+                "direct"
+            ],
+            "tag": "PROXY",
+            "type": "selector"
+        },
+        {
+            "tag": "direct",
+            "type": "direct"
+        },
+        {
+            "tag": "block",
+            "type": "block"
+        },
+        {
+            "tag": "dns-out",
+            "type": "dns"
+        }
+    ],
+    "route": {
+        "final": "PROXY",
+        "rules": [
+            {
+                "port": 53,
+                "outbound": "dns-out"
+            },
+            {
+                "domain_suffix": [
+                    "googlesyndication.com"
+                ],
+                "domain": [
+                    "github.com"
+                ],
+                "outbound": "PROXY"
+            },
+            {
+                "geosite": "category-ads-all",
+                "outbound": "block"
+            }
+        ],
+        "find_process": false,
+        "auto_detect_interface": true
+    },
+    "experimental": {
+        "clash_api": {
+            "external_controller": "127.0.0.1:9090",
+            "external_ui": "./dashboard",
+            "store_selected": true
+        }
+    }
+}

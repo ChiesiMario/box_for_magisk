@@ -1,0 +1,912 @@
+#!/system/bin/sh
+
+scripts=$(realpath "$0")
+scripts_dir=$(dirname "${scripts}")
+source /data/adb/box/settings.ini
+
+# Variabel yang digunakan
+table="223"
+fwmark="223"
+pref="100"
+# disable / enable quic using iptables rules 
+quic="enable"
+
+# Looking for value from "fake-ip-range: / listen: / enhanced-mode: / tun-device:" block in YAML / JSON configuration file
+case "${bin_name}" in
+  "clash")
+    clash_mode=$(busybox awk '!/^ *#/ && /mode: / { print $2;found=1; exit } END{ if(!found) print "rules" }' "${clash_config}" 2>/dev/null)
+    clash_enhanced_mode=$(busybox awk '!/^ *#/ && /enhanced-mode: / { print $2;found=1; exit } END{ if(!found) print "fake-ip" }' "${clash_config}" 2>/dev/null)
+    fake_ip_range=$(busybox awk '!/^ *#/ && /fake-ip-range:/ { print $2; found=1; exit } END { if (!found) print "198.18.0.1/16" }' "${clash_config}" 2>/dev/null)
+    clash_dns_port=$(busybox awk '!/^ *#/ && /listen:/ { split($0, arr, ":"); print arr[3]; found=1; exit } END{ if(!found) print "1053" }' "${clash_config}" 2>/dev/null)
+    if [[ "${network_mode}" == "mixed" || "${proxy_mode}" == "tun" ]]; then
+      tun_device=$(busybox awk '!/^ *#/ && /device: / { print $2;found=1; exit } END{ if(!found) print "utun" }' "${clash_config}" 2>/dev/null)
+    fi
+    ;;
+  "sing-box")
+    if [[ "${network_mode}" == "mixed" || "${proxy_mode}" == "tun" ]]; then
+      tun_device=$(find "${box_dir}/sing-box/" -maxdepth 1 -type f -name "*.json" -exec grep -o '"interface_name": "[^"]*' {} + | busybox awk -F'"' '{print $4}' 2>/dev/null | head -n 1)
+      if [ -z "$tun_device" ]; then
+        tun_device="tun0"
+      fi
+    fi
+    fake_ip_range=$(find ${box_dir}/sing-box/ -maxdepth 1 -type f -name "*.json" -exec busybox awk -F'"' '/inet4_range/ {print $4}' {} +)
+    fake_ip6_range=$(find ${box_dir}/sing-box/ -maxdepth 1 -type f -name "*.json" -exec busybox awk -F'"' '/inet6_range/ {print $4}' {} +)
+    ;;
+  "xray" | "v2fly")
+    if [[ "${network_mode}" == "mixed" || "${proxy_mode}" == "tun" ]]; then
+      log Error "$bin_name does not support proxy_mode: tun or network_mode: mixed"
+      exit 1
+    fi
+    ;;
+  *)
+    log Error "<${bin_name}> unknown binary."
+    exit 1
+    ;;
+esac
+
+misc_info() {
+  case "${bin_name}" in
+    clash)
+      log Debug "enhanced-mode: $clash_enhanced_mode, fake-ip-range: $fake_ip_range, listen-port: $clash_dns_port, mode: $clash_mode"
+      ;;
+    clash|sing-box)
+      if [[ "${network_mode}" == "mixed" || "${proxy_mode}" == "tun" ]]; then
+        log Info "tun_device: $tun_device"
+      fi
+      if [ -n "${fake_ip_range}" ] && [ "${bin_name}" = "sing-box" ]; then
+        log Debug "fakeip inet(v4/v6)_range: ${fake_ip_range}, ${fake_ip6_range}"
+      fi
+      ;;
+    *) 
+      true 
+      ;;
+  esac
+}
+
+box_sync_port() {
+  if [[ "${network_mode}" == "tproxy" && "${proxy_mode}" != "tun" ]]; then
+    netstat -tnulp | grep -q "${tproxy_port}" || log Warning "tproxy_port: ${tproxy_port} out of sync with config"
+  elif [[ "${network_mode}" == "mixed" || "${proxy_mode}" == "tun" ]]; then
+    ifconfig | grep -q "${tun_device}" || log Warning "tun_device: '${tun_device}' not found"
+  fi
+}
+
+find_packages_uid() {
+  echo -n "" > "${uid_list}"
+  for package in "${packages_list[@]}"; do
+      busybox awk -v p="${package}" '$1~p{print $2}' "${system_packages_file}" >> "${uid_list}"
+  done
+}
+
+probe_user_group() {
+  if PID=$(busybox pidof ${bin_name}) ; then
+    box_user=$(stat -c %U /proc/$PID)
+    box_group=$(stat -c %G /proc/$PID)
+    return 0
+  else
+    IFS=':' read -r box_user box_group <<< "${box_user_group}"
+    return 1
+  fi
+}
+
+# Enable IP forwarding
+sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
+[ "${ipv6}" = "true" ] && sysctl -w net.ipv6.conf.all.forwarding=1 > /dev/null 2>&1 || sysctl -w net.ipv6.conf.all.forwarding=0 > /dev/null 2>&1
+
+disable_ipv6() {
+  sysctl -w net.ipv6.conf.all.accept_ra=0
+  sysctl -w net.ipv6.conf.wlan0.accept_ra=0
+  sysctl -w net.ipv6.conf.all.disable_ipv6=1
+  sysctl -w net.ipv6.conf.default.disable_ipv6=1
+  sysctl -w net.ipv6.conf.wlan0.disable_ipv6=1
+} >> /dev/null 2>&1
+
+ipv6_enable() {
+  sysctl -w net.ipv6.conf.all.accept_ra=1
+  sysctl -w net.ipv6.conf.wlan0.accept_ra=1
+  sysctl -w net.ipv6.conf.all.disable_ipv6=0
+  sysctl -w net.ipv6.conf.default.disable_ipv6=0
+  sysctl -w net.ipv6.conf.wlan0.disable_ipv6=0
+} >> /dev/null 2>&1
+
+intranet=(
+  0.0.0.0/8
+  10.0.0.0/8
+  100.64.0.0/10
+  127.0.0.0/8
+  169.254.0.0/16
+  172.16.0.0/12
+  192.0.0.0/24
+  192.0.2.0/24
+  192.88.99.0/24
+  192.168.0.0/16
+  198.51.100.0/24
+  203.0.113.0/24
+  224.0.0.0/4
+  240.0.0.0/4
+  255.255.255.255/32
+)
+
+intranet6=(
+  ::/128
+  ::1/128
+  ::ffff:0:0/96
+  100::/64
+  64:ff9b::/96
+  2001::/32
+  2001:10::/28
+  2001:20::/28
+  2001:db8::/32
+  2002::/16
+  fc00::/7
+  fe80::/10
+  ff00::/8
+)
+
+monitor_local_ip() {
+  [ "${iptables}" = "iptables -w 64" ] && ipv=4 || ipv=6
+  if [ "${iptables}" = "iptables -w 64" ]; then
+    local_ips=($(ip a | busybox awk '$1~/inet$/{print $2}'))
+  else
+    local_ips=($(ip -6 a | busybox awk '$1~/inet6$/{print $2}'))
+  fi
+  local_ip_number=${#local_ips[@]}
+  rules_ips=($(${iptables} -t mangle -nvL FILTER_LOCAL_IP | grep "ACCEPT" | busybox awk '{print $9}'))
+  rules_number=$(${iptables} -t mangle -L FILTER_LOCAL_IP | grep "ACCEPT" | wc -l)
+
+  if [ ${local_ip_number} -ne ${rules_number} ] ; then
+    for rules_subnet in "${rules_ips[@]}" ; do
+      wait_count=0
+      a_subnet=$(busybox ipcalc -n ${rules_subnet} | busybox awk -F '=' '{print $2}')
+      for local_subnet in "${local_ips[@]}" ; do
+        b_subnet=$(busybox ipcalc -n ${local_subnet} | busybox awk -F '=' '{print $2}')
+        if [ "${a_subnet}" != "${b_subnet}" ] ; then
+          wait_count=$((wait_count + 1))
+          if [ ${wait_count} -ge ${local_ip_number} ] ; then
+            ${iptables} -t mangle -D FILTER_LOCAL_IP -d ${rules_subnet} -j ACCEPT
+          fi
+        fi
+      done
+    done
+
+    for subnets in "${local_ips[@]}" ; do
+      if ! (${iptables} -t mangle -C FILTER_LOCAL_IP -d ${subnets} -j ACCEPT > /dev/null 2>&1) ; then
+        ${iptables} -t mangle -I FILTER_LOCAL_IP -d ${subnets} -j ACCEPT
+      fi
+    done
+    log Debug "Filter Local IP($ipv) ${local_ips[*]}"
+
+    unset a_subnet
+    unset b_subnet
+    log Debug "iptables rules for bypassing the local IP($ipv) have been updated."
+  else
+    log Debug "local IP($ipv) remains unchanged, and no processing has been performed."
+    return 1
+  fi
+
+  unset local_ips
+  unset local_ip_number
+  unset rules_ips
+  unset rules_number
+  unset wait_count
+}
+
+forward() {
+  ${iptables} $1 FORWARD -o "${tun_device}" -j ACCEPT
+  ${iptables} $1 FORWARD -i "${tun_device}" -j ACCEPT
+} >> /dev/null 2>&1
+
+# box redirect
+start_redirect() {
+  if [ "${iptables}" = "iptables -w 64" ]; then
+    ${iptables} -t nat -N BOX_EXTERNAL
+    ${iptables} -t nat -F BOX_EXTERNAL
+    ${iptables} -t nat -N BOX_LOCAL
+    ${iptables} -t nat -F BOX_LOCAL
+  fi
+
+  if [ "${iptables}" = "iptables -w 64" ]; then
+    if [ "${bin_name}" = "clash" ]; then
+      ${iptables} -t nat -A BOX_EXTERNAL -p udp --dport 53 -j REDIRECT --to-ports "${clash_dns_port}"
+      ${iptables} -t nat -A BOX_LOCAL -p udp --dport 53 -j REDIRECT --to-ports "${clash_dns_port}"
+
+      #  Other types of inbound should be added here to receive DNS traffic instead of sniffing
+      #  ${iptables} -t nat -A BOX_EXTERNAL -p udp --dport 53 -j REDIRECT --to-ports "${redir_port}"
+      #  ${iptables} -t nat -A BOX_LOCAL -p udp --dport 53 -j REDIRECT --to-ports "${redir_port}"
+    fi
+
+    # Fix ICMP (ping)
+    # This does not guarantee that the ping result is valid
+    # Just that it returns a result
+    # "--to-destination" can be set to a reachable address.
+
+    if [ -n "${fake_ip_range}" ]; then
+      ${iptables} -t nat -A BOX_EXTERNAL -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
+      ${iptables} -t nat -A BOX_LOCAL -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
+    fi
+
+# Allow access to intranet subnets
+    for subnet in "${intranet[@]}"; do
+        ${iptables} -t nat -A BOX_EXTERNAL -d "${subnet}" -m comment --comment "Allow access to intranet subnet ${subnet}" -j RETURN
+        ${iptables} -t nat -A BOX_LOCAL -d "${subnet}" -m comment --comment "Allow access to intranet subnet ${subnet}" -j RETURN
+    done
+
+    ${iptables} -t nat -A BOX_EXTERNAL -p tcp -i lo -j REDIRECT --to-ports "${redir_port}"
+
+    if [ "${ap_list}" != "" ]; then
+      for ap in "${ap_list[@]}"; do
+        ${iptables} -t nat -A BOX_EXTERNAL -p tcp -i "${ap}" -j REDIRECT --to-ports "${redir_port}"
+      done
+      log Info "${ap_list[*]} transparent proxy."
+    fi
+
+    ${iptables} -t nat -I PREROUTING -j BOX_EXTERNAL  
+
+    ${iptables} -t nat -I BOX_LOCAL -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -j RETURN
+
+    if [ "${ignore_out_list}" != "" ]; then
+      for ignore in "${ignore_out_list[@]}"; do
+        ${iptables} -t nat -I BOX_LOCAL -o "${ignore}" -j RETURN
+      done
+      log Info "${ignore_out_list[*]} ignore transparent proxy."
+    fi
+  fi
+
+  # check if iptables is not ip6tables
+  if [ "${iptables}" = "iptables -w 64" ]; then
+    # check proxy mode
+    case "${proxy_mode}" in
+      blacklist)
+        # check if uid list is empty
+        if [ -z "$(cat "${uid_list[@]}")" ] ; then
+          # Route Everything
+          ${iptables} -t nat -A BOX_LOCAL -p tcp -j REDIRECT --to-ports "${redir_port}"
+          log Info "Transparent proxy for all apps."
+        else
+          # Bypass apps
+          # loop through the UID list
+          while read -r appid; do
+            # add iptables rules for returning packets
+            ${iptables} -t nat -I BOX_LOCAL -m owner --uid-owner "${appid}" -j RETURN
+          done < "${uid_list[@]}"
+
+          # close the file handle for the UID list
+          # exec <&-
+
+          # Allow !app
+          ${iptables} -t nat -A BOX_LOCAL -p tcp -j REDIRECT --to-ports "${redir_port}"
+          log Info "proxy-mode: ${proxy_mode} < [ ${packages_list[*]} ] no transparent proxy."
+        fi
+        ;;
+      whitelist)
+        if [ -z "$(cat "${uid_list[@]}")" ] ; then
+          # Route Everything
+          ${iptables} -t nat -A BOX_LOCAL -p tcp -j REDIRECT --to-ports "${redir_port}"
+          log Info "Transparent proxy for all apps."
+        else
+          # Route apps to Box
+          # loop through the UID list
+          while read -r appid; do
+            # add iptables rules for TCP traffic
+            ${iptables} -t nat -A BOX_LOCAL -p tcp -m owner --uid-owner "${appid}" -j REDIRECT --to-ports "${redir_port}"
+          done < "${uid_list[@]}"
+
+          # close the file handle for the UID list
+          # exec <&-
+
+          ${iptables} -t nat -A BOX_LOCAL -p tcp -m owner --uid-owner 0 -j REDIRECT --to-ports "${redir_port}"
+          ${iptables} -t nat -A BOX_LOCAL -p tcp -m owner --uid-owner 1052 -j REDIRECT --to-ports "${redir_port}"
+          log Info "proxy-mode: ${proxy_mode} < [ ${packages_list[*]} ] transparent proxy."
+        fi
+        ;;
+      *)
+        log Warning "proxy-mode: ${proxy_mode} < error."
+        ${iptables} -t nat -A BOX_LOCAL -p tcp -j REDIRECT --to-ports "${redir_port}"
+        log Info "Transparent proxy for all apps."
+        ;;
+    esac
+  fi
+
+  if [ "${iptables}" = "iptables -w 64" ]; then
+    ${iptables} -t nat -I OUTPUT -j BOX_LOCAL
+  fi
+
+  if [ "${iptables}" = "iptables -w 64" ]; then
+    ${iptables} -A OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${redir_port}" -j REJECT
+  else
+    ${iptables} -A OUTPUT -d ::1 -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${redir_port}" -j REJECT
+  fi
+}
+
+stop_redirect() {
+  if [ "${iptables}" = "iptables -w 64" ]; then
+    ${iptables} -t nat -D PREROUTING -j BOX_EXTERNAL
+    ${iptables} -t nat -D OUTPUT -j BOX_LOCAL
+  fi
+
+  if [ "${iptables}" = "iptables -w 64" ]; then
+    ${iptables} -D OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${redir_port}" -j REJECT
+    ${iptables} -D OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner 0:3005 -m tcp --dport "${redir_port}" -j REJECT
+  else
+    ${iptables} -D OUTPUT -d ::1 -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${redir_port}" -j REJECT
+    ${iptables} -D OUTPUT -d ::1 -p tcp -m owner --uid-owner 0:3005 -m tcp --dport "${redir_port}" -j REJECT
+  fi
+
+  if [ "${iptables}" = "iptables -w 64" ]; then
+    if [ -n "${fake_ip_range}" ]; then
+      ${iptables} -t nat -D BOX_EXTERNAL -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
+      ${iptables} -t nat -D BOX_LOCAL -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
+    fi
+
+    ${iptables} -t nat -F BOX_EXTERNAL
+    ${iptables} -t nat -X BOX_EXTERNAL
+    ${iptables} -t nat -F BOX_LOCAL
+    ${iptables} -t nat -X BOX_LOCAL
+  fi
+}
+
+# box tproxy
+start_tproxy() {
+  if [ "${iptables}" = "iptables -w 64" ]; then
+    ip rule add fwmark "${fwmark}" table "${table}" pref "${pref}"
+    ip route add local default dev lo table "${table}"
+  else
+    ip -6 rule add fwmark "${fwmark}" table "${table}" pref "${pref}"
+    ip -6 route add local default dev lo table "${table}"
+  fi
+
+  # Create the BOX_EXTERNAL chain if it doesn't exist
+  ${iptables} -t mangle -N BOX_EXTERNAL 2>/dev/null
+  ${iptables} -t mangle -F BOX_EXTERNAL
+
+  # Bypass box itself
+  # ${iptables} -t mangle -A BOX_EXTERNAL -m mark --mark ${routing_mark} -j RETURN
+
+  # Bypass other if
+  # Notice: Some interface is named with r_ / oem / nm_ / qcom_
+  # It might need more complicated solution.
+  # ${iptables} -t mangle -I BOX_EXTERNAL -i rmnet_data+ -j RETURN
+  # ${iptables} -t mangle -I BOX_EXTERNAL -i ccmni+ -j RETURN
+
+  # Bypass intranet
+  # Add rules for intranet subnets
+  if [ "${iptables}" = "iptables -w 64" ]; then
+    for subnet in "${intranet[@]}"; do
+      if [ "${bin_name}" = "clash" ]; then
+        ${iptables} -t mangle -A BOX_EXTERNAL -d "${subnet}" -j RETURN
+      else
+        ${iptables} -t mangle -A BOX_EXTERNAL -d "${subnet}" -p udp ! --dport 53 -j RETURN
+        ${iptables} -t mangle -A BOX_EXTERNAL -d "${subnet}" ! -p udp -j RETURN
+      fi
+    done
+  else
+  # Add rules for intranet6 subnets
+    for subnet6 in "${intranet6[@]}"; do
+      if [ "${bin_name}" = "clash" ]; then
+        ${iptables} -t mangle -A BOX_EXTERNAL -d "${subnet6}" -j RETURN
+      else
+        ${iptables} -t mangle -A BOX_EXTERNAL -d "${subnet6}" -p udp ! --dport 53 -j RETURN
+        ${iptables} -t mangle -A BOX_EXTERNAL -d "${subnet6}" ! -p udp -j RETURN
+      fi
+    done
+  fi
+  # Append the BOX_EXTERNAL chain to the PREROUTING chain
+  ${iptables} -t mangle -A PREROUTING -j BOX_EXTERNAL
+
+  ${iptables} -t mangle -A BOX_EXTERNAL -p tcp -i lo -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
+  ${iptables} -t mangle -A BOX_EXTERNAL -p udp -i lo -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
+
+  # Allow ap interface
+  # Notice: Old android device may only have one wlan interface.
+  # Some new android device have multiple wlan interface like wlan0(for internet), wlan1(for AP).
+  # loop through the access point list
+  if [ "${ap_list}" != "" ]; then
+    for ap in ${ap_list[@]} ; do
+      # add iptables rules for TCP traffic
+      ${iptables} -t mangle -A BOX_EXTERNAL -p tcp -i "${ap}" -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
+      # add iptables rules for UDP traffic
+      ${iptables} -t mangle -A BOX_EXTERNAL -p udp -i "${ap}" -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${fwmark}"
+    done
+    [ "${iptables}" = "iptables -w 64" ] && log Info "${ap_list[*]} transparent proxy."
+  fi
+
+  ${iptables} -t mangle -I PREROUTING -j BOX_EXTERNAL
+  ${iptables} -t mangle -N BOX_LOCAL
+  ${iptables} -t mangle -F BOX_LOCAL
+
+  # Bypass ignored interfaces
+  if [ "${ignore_out_list}" != "" ]; then
+    for ignore in ${ignore_out_list[@]} ; do
+      ${iptables} -t mangle -I BOX_LOCAL -o "${ignore}" -j RETURN
+    done
+    [ "${iptables}" = "iptables -w 64" ] && log Info "${ignore_out_list[*]} ignore transparent proxy."
+  fi
+
+  # Bypass intranet Clash
+  if [ "${bin_name}" = "clash" ]; then
+    ${iptables} -t mangle -A BOX_LOCAL -p udp --dport 53 -j RETURN
+    if [ "${iptables}" = "iptables -w 64" ]; then
+      for subnet in "${intranet[@]}"; do
+        ${iptables} -t mangle -A BOX_LOCAL -d "${subnet}" -j RETURN
+      done
+    else
+      for subnet6 in "${intranet6[@]}"; do
+        ${iptables} -t mangle -A BOX_LOCAL -d "${subnet6}" -j RETURN
+      done
+    fi
+  else
+    if [ "${iptables}" = "iptables -w 64" ]; then
+      for subnet in "${intranet[@]}"; do
+        ${iptables} -t mangle -A BOX_LOCAL -d "${subnet}" -p udp ! --dport 53 -j RETURN
+        ${iptables} -t mangle -A BOX_LOCAL -d "${subnet}" ! -p udp -j RETURN
+      done
+    else
+      for subnet6 in "${intranet6[@]}"; do
+        ${iptables} -t mangle -A BOX_LOCAL -d "${subnet6}" -p udp ! --dport 53 -j RETURN
+        ${iptables} -t mangle -A BOX_LOCAL -d "${subnet6}" ! -p udp -j RETURN
+      done
+    fi
+  fi
+
+  # Bypass box itself
+  ${iptables} -t mangle -I BOX_LOCAL -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -j RETURN
+  # ${iptables} -t mangle -I BOX_LOCAL -m mark --mark ${routing_mark} -j RETURN
+
+  # Disable kernel
+  # ${iptables} -t mangle -A BOX_LOCAL -m owner ! --uid 0-99999999 -j DROP
+
+  # check proxy mode
+  case "${proxy_mode}" in
+    blacklist)
+      if [ -z "$(cat "${uid_list[@]}")" ] ; then
+        # Route Everything
+        ${iptables} -t mangle -A BOX_LOCAL -p tcp -j MARK --set-mark "${fwmark}"
+        ${iptables} -t mangle -A BOX_LOCAL -p udp -j MARK --set-mark "${fwmark}"
+        [ "${iptables}" = "iptables -w 64" ] && log Info "transparent proxy for all apps."
+      else
+
+        # Bypass apps
+        while read -r appid; do
+          ${iptables} -t mangle -I BOX_LOCAL -m owner --uid-owner "${appid}" -j RETURN
+        done < "${uid_list[@]}"
+
+        # close the file handle for the UID list
+        # exec <&-
+
+        # Allow !app
+        ${iptables} -t mangle -A BOX_LOCAL -p tcp -j MARK --set-mark "${fwmark}"
+        ${iptables} -t mangle -A BOX_LOCAL -p udp -j MARK --set-mark "${fwmark}"
+        [ "${iptables}" = "iptables -w 64" ] && log Info "proxy-mode: ${proxy_mode} < [ ${packages_list[*]} ] no transparent proxy."
+      fi
+      ;;
+    whitelist)
+      if [ -z "$(cat "${uid_list[@]}")" ] ; then
+        # Route Everything
+        ${iptables} -t mangle -A BOX_LOCAL -p tcp -j MARK --set-mark "${fwmark}"
+        ${iptables} -t mangle -A BOX_LOCAL -p udp -j MARK --set-mark "${fwmark}"
+        [ "${iptables}" = "iptables -w 64" ] && log Info "transparent proxy for all apps."
+      else
+        # Route apps to Box
+        # loop through uid list and add iptables rule
+        while read -r appid; do
+          ${iptables} -t mangle -A BOX_LOCAL -p tcp -m owner --uid-owner "${appid}" -j MARK --set-mark "${fwmark}"
+          ${iptables} -t mangle -A BOX_LOCAL -p udp -m owner --uid-owner "${appid}" -j MARK --set-mark "${fwmark}"
+        done < "${uid_list[@]}"
+
+        # close the file handle for the UID list
+        # exec <&-
+
+        ${iptables} -t mangle -A BOX_LOCAL -p tcp -m owner --uid-owner 0 -j MARK --set-mark "${fwmark}"
+        ${iptables} -t mangle -A BOX_LOCAL -p udp -m owner --uid-owner 0 -j MARK --set-mark "${fwmark}"
+        # Route dnsmasq to Box
+        ${iptables} -t mangle -A BOX_LOCAL -p tcp -m owner --uid-owner 1052 -j MARK --set-mark "${fwmark}"
+        ${iptables} -t mangle -A BOX_LOCAL -p udp -m owner --uid-owner 1052 -j MARK --set-mark "${fwmark}"
+        # Route DNS request to Box
+        [ "${bin_name}" != "clash" ] && ${iptables} -t mangle -A BOX_LOCAL -p udp --dport 53 -j MARK --set-mark "${fwmark}"
+        [ "${iptables}" = "iptables -w 64" ] && log Info "proxy-mode: ${proxy_mode} < [ ${packages_list[*]} ] transparent proxy."
+      fi
+      ;;
+    *)
+      log Debug "proxy-mode: ${proxy_mode} < error"
+      ${iptables} -t mangle -A BOX_LOCAL -p tcp -j MARK --set-mark "${fwmark}"
+      ${iptables} -t mangle -A BOX_LOCAL -p udp -j MARK --set-mark "${fwmark}"
+      [ "${iptables}" = "iptables -w 64" ] && log Info "transparent proxy for all apps."
+      ;;
+    esac
+
+  ${iptables} -t mangle -I OUTPUT -j BOX_LOCAL
+
+  ${iptables} -t mangle -N DIVERT
+  ${iptables} -t mangle -F DIVERT
+  ${iptables} -t mangle -A DIVERT -j MARK --set-mark "${fwmark}"
+  ${iptables} -t mangle -A DIVERT -j ACCEPT
+
+  ${iptables} -t mangle -I PREROUTING -p tcp -m socket -j DIVERT
+
+  # Disable QUIC
+  if [ "${quic}" = "disable" ]; then
+    ${iptables} -A OUTPUT -p udp --dport 443 -j REJECT
+    ${iptables} -A OUTPUT -p udp --dport 80 -j REJECT
+    # ${iptables} -A OUTPUT -p udp -m multiport --dport 443,80 -j REJECT
+    [ "${iptables}" = "iptables -w 64" ] && log Warning "disable QUIC"
+  fi
+
+  # This rule blocks local access to tproxy-port to prevent traffic loopback.
+  if [ "${iptables}" = "iptables -w 64" ]; then
+    ${iptables} -A OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${tproxy_port}" -j REJECT
+  else
+    ${iptables} -A OUTPUT -d ::1 -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${tproxy_port}" -j REJECT
+  fi
+
+  # # # Add filter local IP
+  # ${iptables} -t mangle -N FILTER_LOCAL_IP
+  # ${iptables} -t mangle -A PREROUTING -j FILTER_LOCAL_IP
+  # ${iptables} -t mangle -A OUTPUT -j FILTER_LOCAL_IP
+  # monitor_local_ip
+
+  if [ "${iptables}" = "iptables -w 64" ]; then
+    if [ "${bin_name}" = "clash" ]; then
+      # Create and configure CLASH_DNS_EXTERNAL chain
+      ${iptables} -t nat -N CLASH_DNS_EXTERNAL
+      ${iptables} -t nat -F CLASH_DNS_EXTERNAL
+      ${iptables} -t nat -A CLASH_DNS_EXTERNAL -p udp --dport 53 -j REDIRECT --to-ports "${clash_dns_port}"
+      ${iptables} -t nat -I PREROUTING -j CLASH_DNS_EXTERNAL
+
+      # Create and configure CLASH_DNS_LOCAL chain
+      ${iptables} -t nat -N CLASH_DNS_LOCAL
+      ${iptables} -t nat -F CLASH_DNS_LOCAL
+      ${iptables} -t nat -A CLASH_DNS_LOCAL -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -j RETURN
+      ${iptables} -t nat -A CLASH_DNS_LOCAL -p udp --dport 53 -j REDIRECT --to-ports "${clash_dns_port}"
+      ${iptables} -t nat -I OUTPUT -j CLASH_DNS_LOCAL
+    fi
+
+    # Fix ICMP (ping), this does not guarantee that the ping result is valid (proxies such as clash do not support forwarding ICMP),
+    # just that it returns a result, "--to-destination" can be set to a reachable address.
+    if [ -n "${fake_ip_range}" ]; then
+      ${iptables} -t nat -I OUTPUT -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
+      ${iptables} -t nat -I PREROUTING -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
+    fi
+  fi
+}
+
+stop_tproxy() {
+  if [ "${iptables}" = "iptables -w 64" ]; then
+    ip rule del fwmark "${fwmark}" table "${table}" pref "${pref}"
+    ip route del local default dev lo table "${table}"
+    ip route flush table "${table}"
+    ip rule del pref "${pref}"
+  else
+    ip -6 rule del fwmark "${fwmark}" table "${table}" pref "${pref}"
+    ip -6 route del local default dev lo table "${table}"
+    ip -6 route flush table "${table}"
+    ip -6 rule del pref "${pref}"
+  fi
+
+  ${iptables} -t mangle -D PREROUTING -j BOX_EXTERNAL
+  ${iptables} -t mangle -D PREROUTING -p tcp -m socket -j DIVERT
+
+  ${iptables} -t mangle -D OUTPUT -j BOX_LOCAL
+
+  ${iptables} -t mangle -D BOX_EXTERNAL -i rmnet_data+ -j RETURN
+  ${iptables} -t mangle -D BOX_EXTERNAL -i ccmni+ -j RETURN
+
+  ${iptables} -t mangle -F BOX_EXTERNAL
+  ${iptables} -t mangle -X BOX_EXTERNAL
+
+  ${iptables} -t mangle -F BOX_LOCAL
+  ${iptables} -t mangle -X BOX_LOCAL
+
+  ${iptables} -t mangle -F DIVERT
+  ${iptables} -t mangle -X DIVERT
+
+  # # flush filter local IP
+  # ${iptables} -t mangle -D OUTPUT -j FILTER_LOCAL_IP
+  # ${iptables} -t mangle -D PREROUTING -j FILTER_LOCAL_IP
+  # ${iptables} -t mangle -F FILTER_LOCAL_IP
+  # ${iptables} -t mangle -X FILTER_LOCAL_IP
+
+  # flush QUIC
+  # ${iptables} -D OUTPUT -p udp -m multiport --dport 443,80 -j REJECT
+  ${iptables} -D OUTPUT -p udp --dport 443 -j REJECT  
+  ${iptables} -D OUTPUT -p udp --dport 80 -j REJECT
+
+  if [ "${iptables}" = "iptables -w 64" ]; then
+    ${iptables} -D OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${tproxy_port}" -j REJECT
+    ${iptables} -D OUTPUT -d 127.0.0.1 -p tcp -m owner --uid-owner 0 --gid-owner 3005 -m tcp --dport "${tproxy_port}" -j REJECT
+  else
+    ${iptables} -D OUTPUT -d ::1 -p tcp -m owner --uid-owner "${box_user}" --gid-owner "${box_group}" -m tcp --dport "${tproxy_port}" -j REJECT
+    ${iptables} -D OUTPUT -d ::1 -p tcp -m owner --uid-owner 0 --gid-owner 3005 -m tcp --dport "${tproxy_port}" -j REJECT
+  fi
+
+  if [ "${iptables}" = "iptables -w 64" ]; then
+    ${iptables} -t nat -D PREROUTING -j CLASH_DNS_EXTERNAL
+    ${iptables} -t nat -D OUTPUT -j CLASH_DNS_LOCAL
+
+    ${iptables} -t nat -F CLASH_DNS_EXTERNAL
+    ${iptables} -t nat -X CLASH_DNS_EXTERNAL
+
+    ${iptables} -t nat -F CLASH_DNS_LOCAL
+    ${iptables} -t nat -X CLASH_DNS_LOCAL
+
+    if [ -n "${fake_ip_range}" ]; then
+      ${iptables} -t nat -D OUTPUT -p icmp -d "${fake_ip_range}" -j DNAT --to-destination 127.0.0.1
+      ${iptables} -t nat -D PREROUTING -p icmp -d "${fake_ip_range}" -j DNAT --to-destination 127.0.0.1
+
+      ${iptables} -t nat -D OUTPUT -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
+      ${iptables} -t nat -D PREROUTING -d "${fake_ip_range}" -p icmp -j DNAT --to-destination 127.0.0.1
+    fi
+  fi
+}
+
+if [ "${proxy_mode}" != "tun" ]; then
+  case "$1" in
+    enable)
+      misc_info
+      probe_user_group || log Error "failed to check BOX user group, please make sure ${bin_name} kernel is started."
+      #ipv4
+      iptables="iptables -w 64" && {
+        stop_tproxy
+        stop_redirect
+        forward -D
+      } >> /dev/null 2>&1
+      #ipv6
+      iptables="ip6tables -w 64" && {
+        stop_tproxy
+        stop_redirect
+        forward -D
+      } >> /dev/null 2>&1
+      # find uuid apps/game
+      find_packages_uid
+      case "${network_mode}" in
+        tproxy)
+          log Info "use TPROXY: TCP + UDP."
+          log Info "creating iptables transparent proxy rules."
+          iptables="iptables -w 64"
+          intranet+=($(ip address | busybox awk '/inet / && !/127\.0\.0\.1/ {print $2}'))
+          start_tproxy && log Info "create iptables transparent proxy rules done." || { log Error "create iptables transparent proxy rules failed." && stop_tproxy >> /dev/null 2>&1; }
+          if [ "${ipv6}" = "true" ]; then
+            log Debug "use IPv6."
+            ipv6_enable
+            iptables="ip6tables -w 64"
+            intranet6+=($(ip -6 address | busybox awk '/inet6/ && !/::1/ && !/fe80/ {print $2}'))
+            start_tproxy && log Info "create ip(6)tables transparent proxy rules done." || { log Error "create ip(6)tables transparent proxy rules failed." && stop_tproxy >> /dev/null 2>&1; }
+          else
+            disable_ipv6
+            log Warning "disable IPv6."
+          fi
+        ;;
+        redirect)
+          log Info "use REDIRECT: TCP ONLY"
+          log Info "creating iptables transparent proxy rules."
+          iptables="iptables -w 64"
+          intranet+=($(ip address | busybox awk '/inet / && !/127\.0\.0\.1/ {print $2}'))
+          start_redirect && log Info "create iptables transparent proxy rules done." || { log Error "create iptables transparent proxy rule failed." && stop_redirect >> /dev/null 2>&1; }
+          if [ "${ipv6}" = "true" ]; then
+            log Debug "use IPv6."
+            ipv6_enable
+            iptables="ip6tables -w 64"
+            intranet6+=($(ip -6 address | busybox awk '/inet6/ && !/::1/ && !/fe80/ {print $2}'))
+            start_redirect && log Info "create ip(6)tables transparent proxy rules done." || { log Error "create ip(6)tables transparent proxy rule failed." && stop_redirect >> /dev/null 2>&1; }
+          else
+            disable_ipv6
+            log Warning "disable IPv6."
+          fi
+        ;;
+        mixed)
+          log Info "use MIXED: TCP + TUN"
+          log Info "creating iptables transparent proxy rules."
+          iptables="iptables -w 64"
+          forward -I || forward -D >> /dev/null 2>&1
+          intranet+=($(ip address | busybox awk '/inet / && !/127\.0\.0\.1/ {print $2}'))
+          start_redirect && log Info "create iptables transparent proxy rules done." || (log Error "create iptables transparent proxy rule failed." && stop_redirect >> /dev/null 2>&1)
+          if [ "${ipv6}" = "true" ]; then
+            log Debug "use IPv6."
+            ipv6_enable
+            iptables="ip6tables -w 64"
+            intranet6+=($(ip -6 address | busybox awk '/inet6/ && !/::1/ && !/fe80/ {print $2}'))
+            forward -I || forward -D >> /dev/null 2>&1
+            start_redirect && log Info "create ip(6)tables transparent proxy rules done." || (log Error "create ip(6)tables transparent proxy rule failed." && stop_redirect >> /dev/null 2>&1)
+          else
+            disable_ipv6
+            log Warning "disable IPv6."
+          fi
+        ;;
+        *)
+          log Error "network_mode: ${network_mode}, unknown"
+          exit 1
+        ;;
+      esac
+      box_sync_port
+      log Info "${bin_name} connected."
+      ;;
+    renew)
+      probe_user_group || log Error "failed to check BOX user group, please make sure ${bin_name} kernel is started."
+      log Warning "cleaning up iptables transparent proxy rules."
+      iptables="iptables -w 64" && {
+        stop_tproxy
+        stop_redirect
+        forward -D
+      } >> /dev/null 2>&1
+      iptables="ip6tables -w 64" && {
+        stop_tproxy
+        stop_redirect
+        forward -D
+      } >> /dev/null 2>&1
+      log Warning "clean up iptables transparent proxy rules done."
+      misc_info
+      find_packages_uid
+      case "${network_mode}" in
+        tproxy)
+          log Info "use TPROXY: TCP + UDP."
+          log Info "creating iptables transparent proxy rules."
+          iptables="iptables -w 64"
+          intranet+=($(ip address | busybox awk '/inet / && !/127\.0\.0\.1/ {print $2}'))
+          start_tproxy && log Info "create iptables transparent proxy rules done." || { log Error "create iptables transparent proxy rules failed." && stop_tproxy >> /dev/null 2>&1; }
+          if [ "${ipv6}" = "true" ]; then
+            log Debug "use IPv6."
+            ipv6_enable
+            iptables="ip6tables -w 64"
+            intranet6+=($(ip -6 address | busybox awk '/inet6/ && !/::1/ && !/fe80/ {print $2}'))
+            start_tproxy && log Info "create ip(6)tables transparent proxy rules done." || { log Error "create ip(6)tables transparent proxy rules failed." && stop_tproxy >> /dev/null 2>&1; }
+          else
+            disable_ipv6
+            log Warning "disable IPv6."
+          fi
+        ;;
+        redirect)
+          log Info "use REDIRECT: TCP ONLY"
+          log Info "creating iptables transparent proxy rules."
+          iptables="iptables -w 64"
+          intranet+=($(ip address | busybox awk '/inet / && !/127\.0\.0\.1/ {print $2}'))
+          start_redirect && log Info "create iptables transparent proxy rules done." || { log Error "create iptables transparent proxy rule failed." && stop_redirect >> /dev/null 2>&1; }
+          if [ "${ipv6}" = "true" ]; then
+            log Debug "use IPv6."
+            ipv6_enable
+            iptables="ip6tables -w 64"
+            intranet6+=($(ip -6 address | busybox awk '/inet6/ && !/::1/ && !/fe80/ {print $2}'))
+            start_redirect && log Info "create ip(6)tables transparent proxy rules done." || { log Error "create ip(6)tables transparent proxy rule failed." && stop_redirect >> /dev/null 2>&1; }
+          else
+            disable_ipv6
+            log Warning "disable IPv6."
+          fi
+        ;;
+        mixed)
+          log Info "use MIXED: TCP + TUN"
+          log Info "creating iptables transparent proxy rules."
+          iptables="iptables -w 64"
+          forward -I || forward -D >> /dev/null 2>&1
+          intranet+=($(ip address | busybox awk '/inet / && !/127\.0\.0\.1/ {print $2}'))
+          start_redirect && log Info "create iptables transparent proxy rules done." || { log Error "create iptables transparent proxy rule failed." && stop_redirect >> /dev/null 2>&1; }
+          if [ "${ipv6}" = "true" ]; then
+            log Debug "use IPv6."
+            ipv6_enable
+            iptables="ip6tables -w 64"
+            intranet6+=($(ip -6 address | busybox awk '/inet6/ && !/::1/ && !/fe80/ {print $2}'))
+            forward -I || forward -D >> /dev/null 2>&1
+            start_redirect && log Info "create ip(6)tables transparent proxy rules done." || { log Error "create ip(6)tables transparent proxy rule failed." && stop_redirect >> /dev/null 2>&1; }
+          else
+            disable_ipv6
+            log Warning "disable IPv6."
+          fi
+        ;;
+        *)
+          log Error "network_mode: ${network_mode}, unknown"
+          exit 1
+        ;;
+      esac
+      box_sync_port
+      log Info "restart iptables transparent proxy rules done."
+      log Info "${bin_name} connected."
+      ;;
+    disable)
+      ipv6_enable
+      probe_user_group || log Error "failed to check BOX user group, please make sure ${bin_name} kernel is started."
+      log Warning "clean up iptables transparent proxy rules."
+      #ipv4
+      iptables="iptables -w 64" && {
+        stop_tproxy
+        stop_redirect
+        forward -D
+      } >> /dev/null 2>&1
+      #ipv6
+      iptables="ip6tables -w 64" && {
+        stop_tproxy
+        stop_redirect
+        forward -D
+      } >> /dev/null 2>&1
+      log Warning "clean up iptables transparent proxy rules done."
+      ;;
+    *)
+      echo "${red}$0 $1 no found${normal}"
+      echo "${yellow}usage${normal}: ${green}$0${normal} {${yellow}enable|disable|renew${normal}}"
+      ;;
+  esac
+else
+  case "$1" in
+    enable)
+      misc_info
+      log Info "use TUN: TCP + UDP"
+      probe_user_group || log Error "failed to check BOX user group, please make sure ${bin_name} kernel is started."
+      #ipv4
+      iptables="iptables -w 64" && {
+        stop_tproxy
+        stop_redirect
+        forward -D
+      } >> /dev/null 2>&1
+      #ipv6
+      iptables="ip6tables -w 64" && {
+        stop_tproxy
+        stop_redirect
+        forward -D
+      } >> /dev/null 2>&1
+      iptables="iptables -w 64"
+      forward -I && log Info "create iptables tun rules done." || { log Error "create iptables tun rules failed." && forward -D >> /dev/null 2>&1; }
+      if [ "${ipv6}" = "true" ]; then
+        log Debug "use IPv6."
+        ipv6_enable
+        iptables="ip6tables -w 64"
+        forward -I && log Info "create ip(6)tables tun rules done." || { log Error "create ip(6)tables tun rules failed." && forward -D >> /dev/null 2>&1; }
+      else
+        disable_ipv6
+        log Warning "disable IPv6."
+      fi
+      box_sync_port
+      log Info "${bin_name} connected."
+      ;;
+    renew)
+      log Info "use TUN: TCP + UDP"
+      probe_user_group || log Error "failed to check BOX user group, please make sure ${bin_name} kernel is started."
+      log Warning "cleaning up tun rules."
+      #ipv4
+      iptables="iptables -w 64" && {
+        stop_tproxy
+        stop_redirect
+        forward -D
+      } >> /dev/null 2>&1
+      #ipv6
+      iptables="ip6tables -w 64" && {
+        stop_tproxy
+        stop_redirect
+        forward -D
+      } >> /dev/null 2>&1
+      log Warning "clean up tun rules done."
+      misc_info
+      iptables="iptables -w 64"
+      forward -I && log Info "create iptables tun rules done." || { log Error "create iptables tun rules failed." && forward -D >> /dev/null 2>&1; }
+      if [ "${ipv6}" = "true" ]; then
+        log Debug "use IPv6."
+        ipv6_enable
+        iptables="ip6tables -w 64"
+        forward -I && log Info "create ip(6)tables tun rules done." || { log Error "create ip(6)tables tun rules failed." && forward -D >> /dev/null 2>&1; }
+      else
+        disable_ipv6
+        log Warning "disable IPv6."
+      fi
+      box_sync_port
+      log Info "restart iptables tun rules done."
+      log Info "${bin_name} connected."
+      ;;
+    disable)
+      ipv6_enable
+      probe_user_group || log Error "failed to check BOX user group, please make sure ${bin_name} kernel is started."
+      log Warning "cleaning up tun rules."
+      #ipv4
+      iptables="iptables -w 64" && {
+        stop_tproxy
+        stop_redirect
+        forward -D
+      } >> /dev/null 2>&1
+      #ipv6
+      iptables="ip6tables -w 64" && {
+        stop_tproxy
+        stop_redirect
+        forward -D
+      } >> /dev/null 2>&1
+      log Warning "clean up tun rules done."
+      ;;
+    *)
+      echo "${red}$0 $1 no found${normal}"
+      echo "${yellow}usage${normal}: ${green}$0${normal} {${yellow}enable|disable|renew${normal}}"
+      ;;
+  esac
+fi
