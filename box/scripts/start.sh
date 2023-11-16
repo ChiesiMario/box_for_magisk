@@ -9,9 +9,6 @@ moddir="/data/adb/modules/box_for_root"
 busybox="/data/adb/magisk/busybox"
 [ -f "/data/adb/ksu/bin/busybox" ] && busybox="/data/adb/ksu/bin/busybox"
 
-# Update Sbus
-/data/adb/box/scripts/box.tool subs
-
 refresh_box() {
   if [ -f "/data/adb/box/run/box.pid" ]; then
     "${scripts_dir}/box.service" stop >> "/dev/null" 2>&1
@@ -49,6 +46,7 @@ start_inotifyd() {
   inotifyd "${scripts_dir}/box.inotify" "${moddir}" >> "/dev/null" 2>&1 &
 }
 
+mkdir -p /data/adb/box/run/
 if [ -f "/data/adb/box/manual" ]; then
   exit 1
 fi

@@ -11,14 +11,13 @@ box_check_logs() {
   log Info "deleting and backup logs"
   for bin in "${bin_list[@]}"; do
     if [ -f "${box_run}/${bin}.log" ]; then
-      mv "${box_run}/${bin}.log" "${box_run}/${bin}-$(date +%Y-%m-%d-%H-%M-%S).log"
-      # rm -f "${box_run}/${bin}.log"
+      mv "${box_run}/${bin}.log" "${box_run}/${bin}.old.log"
     fi
   done
   # Delete other log files
   find "${box_run}" -maxdepth 1 -type f \( -name "root" -o -name "*.list" -o -name "*.inotify.log" \) -exec rm -f {} +
-  # Delete logs 10 minutes ago or older
-  find "${box_run}" -maxdepth 1 -type f -name "*.log" -mmin +10 -exec rm -f {} +
+  # Delete logs that are three days old or older
+  find "${box_run}" -maxdepth 1 -type f -name "*.log" -mtime +3 -exec rm -f {} +
 }
 
 box_bin_alive() {
@@ -40,9 +39,9 @@ box_bin_alive() {
 }
 
 box_run_crontab() {
-  # Start crond with the "-c" option and keep it in the background
+  # start crond with the "-c" option and keep it in the background
   nohup busybox crond -c "${box_run}" > /dev/null 2>&1 &
-  # Delete the previous crontab and create a new crontab
+  # delete the previous crontab and create a new crontab
   busybox crontab -c "${box_run}" -r
   touch "${box_run}/root"
   chmod 0755 "${box_run}/root"
@@ -52,7 +51,7 @@ box_run_crontab() {
     echo "${interva_update} ${scripts_dir}/box.tool geosub" >> "${box_run}/root"
     log Debug "Interval crontab geox and subs: ${interva_update}."
     log Info "${bin_name} geox updates: ${update_geo}."
-    if [[ "${bin_name}" == @(clash|sing-box) ]]; then
+    if [ "${bin_name}" = "clash" ]; then
       log Info "${bin_name} subscription update: ${update_subscription}."
     fi
   else
@@ -61,49 +60,51 @@ box_run_crontab() {
   fi
 }
 
+xclash() {
+  local clash_option="${clash_option:-meta}"
+  # default to "meta" if clash_option is not set
+  current_clash="$(readlink "${bin_dir}/clash")"
+
+  if [ "$current_clash" != "${bin_dir}/xclash/clash_${clash_option}" ]; then
+    if [ -f "${bin_dir}/xclash/clash_${clash_option}" ]; then
+      if ! ln -sf "${bin_dir}/xclash/clash_${clash_option}" "${bin_dir}/clash"; then
+        log Error "Failed to use clash_${clash_option}"
+        return 1
+      fi
+    else
+      mkdir -p "${bin_dir}/xclash"
+      log Error "${bin_dir}/xclash/clash_${clash_option} file not found"
+      return 1
+    fi
+  fi
+  log Info "xclash [ clash_$clash_option ] setup completed successfully"
+}
+
+box_ownership() {
+  # Set ownership and permission of kernel directory
+  chown ${box_user_group} ${bin_path}
+  chown -R ${box_user_group} ${box_dir}
+  chmod 6755 ${bin_path}
+  chmod -R 644 ${box_dir}/${bin_name}
+  chmod 0755 ${box_dir}/bin/yq
+  chmod 0755 ${box_dir}/bin/curl
+}
+
 box_permission() {
   if [[ "${box_user_group}" == @(root:net_admin|0:3005) && -f "${bin_path}" ]]; then
     # Set ownership and permission of kernel directory
-    chown ${box_user_group} ${bin_path}
-    chmod 6755 ${bin_path}
-    chmod 0644 "${box_dir}/${bin_name}"/*
-    chmod 0755 "${box_dir}/bin/yq"
-    # Set ownership of data directory
-    chown -R ${box_user_group} ${box_dir}
-    log Info "Use the kernel located in '${bin_path}'."
-  elif which ${bin_name} | grep -q "/system/bin/"; then
-    mount -o remount,rw /system/bin/$bin_name
-    box_user=$(echo ${box_user_group} | busybox awk -F ':' '{print $1}')
-    box_group=$(echo ${box_user_group} | busybox awk -F ':' '{print $2}')
-    box_user_id=$(id -u ${box_user})
-    box_group_id=$(id -g ${box_group})
-    # Check if box_user and box_group exist
-    if ! [[ ${box_user_id} && ${box_group_id} ]]; then
-     log Error "${box_user_group} error, use root:net_admin instead."
-     box_user_group="root:net_admin"
-    fi
-    bin_path=$(which ${bin_name})
-    # Set ownership and permission of kernel directory
-    chown ${box_user_group} ${bin_path}
-    chmod 6755 ${bin_path}
-    chmod 0644 "${box_dir}/${bin_name}"/*
-    chmod 0755 "${box_dir}/bin/yq"
-    # Check if user is not root and group is not net_admin
-    if [[ "${box_user_id}" != "0" || "${box_group_id}" != "3005" ]]; then
-      # Set capability of kernel directory
-      if ! setcap 'cap_net_admin,cap_net_raw,cap_net_bind_service+ep' "${bin_path}"; then
-        log Error "setcap authorization failed, you may need libcap package."
-      fi
-    fi
-    # Set ownership of data directory
-    box_user_group="root:net_admin"
-    log Info "Using kernel directory ${bin_name} in ${bin_path}"
-    chown -R ${box_user_group} ${box_dir}
+    box_ownership
+    log Info "Using kernel in ${bin_path}."
   else
-    sed -i "s/box_user_group=.*/box_user_group=\"root:net_admin\"/g" ${settings}
+    if  [[ "${box_user_group}" != @(root:net_admin|0:3005) ]]; then
+      log Error "does't support user_group [ $box_user_group ]"
+      sed -i "s/box_user_group=.*/box_user_group=\"root:net_admin\"/g" ${settings}
+      log Debug "automatically changed to [ root:net_admin ], restart box"
+      exit 1
+    fi
     log Error "Kernel <${bin_name}> is missing."
     log Error "Please download the <${bin_name}> kernel and place it in the ${bin_dir}/ directory."
-    log Debug "or executed: su -c /data/adb/box/scripts/box.tool upcore ."
+    log Debug "exec: su -c /data/adb/box/scripts/box.tool upkernel"
     exit 1
   fi
 }
@@ -142,60 +143,60 @@ prepare_singbox() {
     log Info "config ${sing_config}"
   fi
 
-  yq_cmd="yq"
+  yq_command="yq"
   if ! command -v yq &>/dev/null; then
     if [ ! -e "${box_dir}/bin/yq" ]; then
       log Debug "yq file not found, start to download from github"
       ${scripts_dir}/box.tool upyq
     fi
-    yq_cmd="${box_dir}/bin/yq"
+    yq_command="${box_dir}/bin/yq"
   fi
   # delete Toggle comment, because yq doesn't work, Execute the sed command to uncomment the "/* ... */", "//" line
   sed -i '/\/\*/,/\*\//d; /^[[:space:]]*\/\//d; /^( *\/\/|\/\*.*\*\/)$/d' "${box_dir}/sing-box/"*.json
   if [[ "${network_mode}" == "mixed" || "${proxy_mode}" == "tun" ]]; then
     if grep -q '"type": "tproxy"' "${sing_config}"; then
-      "${yq_cmd}" 'del(.inbounds[] | select(.type == "tproxy"))' -i --output-format=json "${sing_config}"
+      "${yq_command}" 'del(.inbounds[] | select(.type == "tproxy"))' -i --output-format=json "${sing_config}"
     fi
     # Checks if "type" is "tun" in configuration
     if grep -q '"type": "tun"' "${sing_config}"; then
-      log Info "type (tun) already exists in ${sing_config}"
+      log Info "type [Tun] already exists in ${sing_config}"
     else
       # Add "tun" configuration if missing
-      "${yq_cmd}" '.inbounds += [{"type": "tun","tag": "tun-in","interface_name": "tun3","inet4_address": "172.19.0.1/30","inet6_address": "fdfe:dcba:9876::1/126","mtu": 9000,"stack": "system","auto_route": true,"strict_route": false,"sniff": true,"sniff_override_destination": false,"include_android_user": [0,10],"include_package": [],"exclude_package": []}]' -i --output-format=json "${sing_config}"
-      log Debug "(tun) configuration has been added to ${sing_config}"
+      "${yq_command}" '.inbounds += [{"type": "tun","tag": "tun-in","interface_name": "tun3","inet4_address": "172.19.0.1/30","inet6_address": "fdfe:dcba:9876::1/126","mtu": 9000,"stack": "system","auto_route": true,"strict_route": false,"sniff": true,"sniff_override_destination": false,"include_android_user": [0,10],"include_package": [],"exclude_package": []}]' -i --output-format=json "${sing_config}"
+      log Debug "[Tun] configuration has been added to ${sing_config}"
     fi
     # Checks if "type" is "redirect" in configuration
     if [ "${network_mode}" = "mixed" ]; then
       if grep -q '"type": "redirect"' "${sing_config}"; then
-        log Info "type (redirect) already exists in ${sing_config}"
+        log Info "type [Redirect] already exists in ${sing_config}"
       else
         # Add "redirect" configuration if missing
-        "${yq_cmd}" '.inbounds += [{"type": "redirect","tag": "redirect-in","listen": "::","listen_port": '"${redir_port}"',"sniff": true,"sniff_override_destination": false}]' -i --output-format=json "${sing_config}"
-        log Debug "(redirect) configuration has been added to ${sing_config}"
+        "${yq_command}" '.inbounds += [{"type": "redirect","tag": "redirect-in","listen": "::","listen_port": '"${redir_port}"',"sniff": true,"sniff_override_destination": false}]' -i --output-format=json "${sing_config}"
+        log Debug "[Redirect] configuration has been added to ${sing_config}"
       fi
     fi
     sed -i 's/"auto_detect_interface": false/"auto_detect_interface": true/g' "${box_dir}/sing-box/"*.json
     sed -i 's/auto_route": false/auto_route": true/g' "${box_dir}/sing-box/"*.json
   else
     if grep -q '"type": "tun"' "${sing_config}"; then
-      "${yq_cmd}" 'del(.inbounds[] | select(.type == "tun"))' -i --output-format=json "${sing_config}"
+      "${yq_command}" 'del(.inbounds[] | select(.type == "tun"))' -i --output-format=json "${sing_config}"
     fi
     if grep -q '"type": "redirect"' "${sing_config}"; then
-      "${yq_cmd}" 'del(.inbounds[] | select(.type == "redirect"))' -i --output-format=json "${sing_config}"
+      "${yq_command}" 'del(.inbounds[] | select(.type == "redirect"))' -i --output-format=json "${sing_config}"
     fi
     # Checks if "type" is "tproxy" in configuration
     if grep -q '"type": "tproxy"' "${sing_config}"; then
-      log Info "type (tproxy) already exists in ${sing_config}"
+      log Info "type [Tproxy] already exists in ${sing_config}"
     else
       # Add "tproxy" configuration if missing
-      "${yq_cmd}" '.inbounds += [{"type": "tproxy", "tag": "tproxy-in", "listen": "::", "listen_port": '"${tproxy_port}"', "sniff": true, "sniff_override_destination": false}]' -i --output-format=json "${sing_config}"
-      log Debug "(tproxy) configuration has been added to ${sing_config}"
+      "${yq_command}" '.inbounds += [{"type": "tproxy", "tag": "tproxy-in", "listen": "::", "listen_port": '"${tproxy_port}"', "sniff": true, "sniff_override_destination": false}]' -i --output-format=json "${sing_config}"
+      log Debug "[Tproxy] configuration has been added to ${sing_config}"
     fi
     # sync tproxy port sing-box, Looping through each JSON file in the directory
     for file in "${box_dir}/sing-box/"*.json; do
       tproxy=$(sed -n 's/.*"type": "\(tproxy\)".*/\1/p' "${file}")
       if [ -n "${tproxy}" ]; then
-        "${yq_cmd}" -o=json "(.inbounds[]? | select(.type == \"tproxy\") | .listen_port) = ${tproxy_port}" -i --output-format=json "${file}"
+        "${yq_command}" -o=json "(.inbounds[]? | select(.type == \"tproxy\") | .listen_port) = ${tproxy_port}" -i --output-format=json "${file}"
       fi
     done
     sed -i 's/"auto_detect_interface": true/"auto_detect_interface": false/g' "${box_dir}/sing-box/"*.json
@@ -222,16 +223,19 @@ prepare_clash() {
   if [ -z "${clash_external_controller}" ]; then
     printf "\nexternal-controller: 0.0.0.0:9090" >> "${clash_config}"
   fi
+
   # write external_ui, if not in $clash_config
   clash_external_ui=$(busybox awk '!/^ *#/ && /external-ui: /{print $1}' "${clash_config}")
   if [ -z "${clash_external_ui}" ]; then
     printf "\nexternal-ui: ./dashboard" >> "${clash_config}"
   fi
+
   # write tproxy-port, if not in $clash_config
   clash_tproxy_port=$(busybox awk '!/^ *#/ && /tproxy-port: /{print $1}' "${clash_config}")
   if [ -z "${clash_tproxy_port}" ]; then
     printf "\ntproxy-port: ${tproxy_port}" >> "${clash_config}"
   fi
+
   # write redir-port, if not in $clash_config
   clash_redir_port=$(busybox awk '!/^ *#/ && /redir-port: /{print $1}' "${clash_config}")
   if [ -z "${clash_redir_port}" ]; then
@@ -281,15 +285,14 @@ prepare_clash() {
   clash_enhanced_mode=$(busybox awk '!/^ *#/ && /enhanced-mode: / { print $2 }' "${clash_config}" 2>/dev/null)
   if [ -z "${clash_enhanced_mode}" ]; then
     # Add enhanced-mode: fake-ip
-    sed -i '/dns:/ {n; /enable:.*/ {a\  enhanced-mode: fake-ip
-    }}' "$clash_config"
+    sed -i '/dns:/ {n; /enable:.*/ {a\  enhanced-mode: fake-ip}}' "$clash_config"
     log Debug "enhanced-mode: fake-ip add success"
   fi
 
   if [ "${proxy_mode}" != "tun" ]; then
-    if [ -n "${packages_list[*]}" ] && [ "${clash_enhanced_mode}" = "fake-ip" ]; then
-      log Debug "${proxy_mode} only works in enhanced-mode: redir-host (clash.meta)"
-      log Debug "auto replace fake-ip > redir-host"
+    if [[ -n "${packages_list[*]}" || -n "${gid_list[*]}" ]] && [ "${clash_enhanced_mode}" = "fake-ip" ]; then
+      log Warning "${proxy_mode} only works in enhanced-mode: redir-host [Clash.Meta]"
+      log Warning "auto replace fake-ip > redir-host"
       sed -i "s/enhanced-mode:.*/enhanced-mode: redir-host/g" "${clash_config}"
     fi
   fi
@@ -317,8 +320,8 @@ box_run_bin() {
   case "${bin_name}" in
     sing-box)
       prepare_singbox
-      if ${bin_path} check -D "${box_dir}/${bin_name}" --config-directory "${box_dir}/${bin_name}" > "${box_run}/${bin_name}.log" 2>&1; then
-        nohup busybox setuidgid "${box_user_group}" "${bin_path}" run -D "${box_dir}/${bin_name}" --config-directory "${box_dir}/${bin_name}" > "${bin_log}" 2>&1 &
+      if ${bin_path} check -D "${box_dir}/${bin_name}" -C "${box_dir}/${bin_name}" > "${box_run}/${bin_name}.log" 2>&1; then
+        nohup busybox setuidgid "${box_user_group}" taskset "${mask_cpuset}" "${bin_path}" run -D "${box_dir}/${bin_name}" -C "${box_dir}/${bin_name}" > "${bin_log}" 2>&1 &
         PID=$!
         echo -n $PID > "${box_pid}"
         sleep 1
@@ -331,7 +334,7 @@ box_run_bin() {
     clash)
       prepare_clash
       if ${bin_path} -t -d "${box_dir}/${bin_name}" -f "${clash_config}" > "${box_run}/${bin_name}.log" 2>&1; then
-        nohup busybox setuidgid "${box_user_group}" "${bin_path}" -d "${box_dir}/${bin_name}" -f "${clash_config}" > "${bin_log}" 2>&1 &
+        nohup busybox setuidgid "${box_user_group}" taskset "${mask_cpuset}" "${bin_path}" -d "${box_dir}/${bin_name}" -f "${clash_config}" > "${bin_log}" 2>&1 &
         PID=$!
         echo -n $PID > "${box_pid}"
         sleep 1
@@ -362,7 +365,7 @@ box_run_bin() {
       # run xray
       export XRAY_LOCATION_ASSET="${box_dir}/${bin_name}"
       if ${bin_path} -test -confdir "${box_dir}/${bin_name}" > "${box_run}/${bin_name}.log" 2>&1; then
-        nohup busybox setuidgid "${box_user_group}" "${bin_path}" run -confdir "${box_dir}/${bin_name}" > "${bin_log}" 2>&1 &
+        nohup busybox setuidgid "${box_user_group}" taskset "${mask_cpuset}" "${bin_path}" run -confdir "${box_dir}/${bin_name}" > "${bin_log}" 2>&1 &
         PID=$!
         echo -n $PID > "${box_pid}"
         sleep 1
@@ -391,8 +394,8 @@ box_run_bin() {
 
       # run v2ray
       export V2RAY_LOCATION_ASSET="${box_dir}/${bin_name}"
-      if ${bin_path} test -confdir "${box_dir}/${bin_name}" > "${box_run}/${bin_name}.log" 2>&1; then
-        nohup busybox setuidgid "${box_user_group}" "${bin_path}" run -d "${box_dir}/${bin_name}" > "${bin_log}" 2>&1 &
+      if ${bin_path} test -d "${box_dir}/${bin_name}" > "${box_run}/${bin_name}.log" 2>&1; then
+        nohup busybox setuidgid "${box_user_group}" taskset "${mask_cpuset}" "${bin_path}" run -d "${box_dir}/${bin_name}" > "${bin_log}" 2>&1 &
         PID=$!
         echo -n $PID > "${box_pid}"
         sleep 1
@@ -410,17 +413,25 @@ box_run_bin() {
 }
 
 box_cgroup() {
-  if [ "${cgroup_memory}" = "true" ]; then
-    if ${scripts_dir}/box.tool cgroup; then
-      log Info "cgroup limit: ${cgroup_memory_limit}."
+  set_cgroup_config() {
+    local cgroup_attr="$1"
+    local cgroup_value="$2"
+
+    if [ "${cgroup_value}" = "true" ]; then
+      if ${scripts_dir}/box.tool "${cgroup_attr}"; then
+        true
+      else
+        log Warning "failed to enable ${cgroup_attr} for ${bin_name}."
+        log Warning "cgroups ${cgroup_attr} is turned off"
+        sed -i -E "/cgroup_${cgroup_attr}/ s/(true)/false/" "${settings}"
+      fi
     else
-      log Warning "failed to enable cgroup for ${bin_name}."
-      log Warning "cgroups is turned off"
-      sed -i -E "/cgroup_memory/ s/(true)/false/" "${settings}"
+      log Info "${bin_name} cgroup_${cgroup_attr}: ${cgroup_value}"
     fi
-  else
-    log Info "${bin_name} cgroup: disabled."
-  fi
+  }
+  set_cgroup_config "memcg" "${cgroup_memcg}"
+  set_cgroup_config "cpuset" "${cgroup_cpuset}"
+  set_cgroup_config "blkio" "${cgroup_blkio}"
 }
 
 # Function to display the usage of a binary
@@ -456,14 +467,28 @@ box_bin_status() {
 
   # Get the CPU usage of the binary
   cpu=$(ps -p $PID -o %cpu | busybox awk 'NR==2{print $1}' 2> /dev/null)
+
+  cpus_allowed=$(grep Cpus_allowed_list /proc/$PID/status | busybox awk '{ print $2" "$3 }')
+  cpuset=$(ps -p $PID -o cpu | busybox awk 'NR==2{print $1}' 2> /dev/null)
+
   if [ -n "${cpu}" ]; then
     log Info "${bin_name} CPU usage: ${cpu}%"
   else
     log Info "${bin_name} CPU usage: not available"
   fi
+  if [ -n "${cpuset}" ]; then
+    log Info "${bin_name} list of allowed CPUs : ${cpus_allowed}"
+    log Info "${bin_name} Which CPU running on : ${cpuset}"
+  else
+    log Info "${bin_name} Which CPU running on : not available"
+  fi
+
+  # Check battery temperature
+  temperature_celsius=$(($(cat /sys/class/power_supply/battery/temp) / 10))
+  log Info "battery temperature: ${temperature_celsius}°C"
 
   # Get the running time of the binary
-  running_time=$(ps -p $PID -o etime | busybox awk 'NR==2{print $1}' 2> /dev/null)
+  running_time=$(busybox ps -o comm,etime | grep ${bin_name} | busybox awk '{print $2}')
   if [ -n "${running_time}" ]; then
     log Info "${bin_name} running time: ${running_time}"
   else
@@ -472,7 +497,7 @@ box_bin_status() {
 
   # Save the process ID to the pid file
   if [ -n "$PID" ]; then
-    sed -Ei 's/^description=(\[.*][[:space:]]*)?/description=[ ☑️ '${bin_name}' service is running ] /g' "$PROPFILE"
+    sed -Ei "s/^description=(\[.*][[:space:]]*)?/description=[ ⏲ $current_time | ✔ $bin_name service is running!!! ] /g" "$PROPFILE"
     echo -n "$PID" > "${box_pid}"
   fi
 }
@@ -480,7 +505,7 @@ box_bin_status() {
 start_box() {
   # Clear the log file and add the timestamp and delimiter
   # cd /data/adb/box/bin; chmod 755 *
-  sed -Ei 's/^description=(\[.*][[:space:]]*)?/description=[ ⚠️ Module is working! but no service is running ] /g' "$PROPFILE"
+  sed -Ei "s/^description=(\[.*][[:space:]]*)?/description=[ ⏲ $current_time | ☹ Module is working! but no service is running ] /g" "$PROPFILE"
 
   echo -n "" > "${box_log}"
   box_version=$(busybox awk '!/^ *#/ && /version=/ { print $0 }' "/data/adb/modules/box_for_root/module.prop" 2>/dev/null)
@@ -491,11 +516,13 @@ start_box() {
     echo -e "${yellow}${box_version}${normal}"
     echo -e "${white}--------------------------------------------${normal}"
   else
-    echo "$(getprop persist.sys.timezone)" | tee -a "${box_log}" > /dev/null 2>&1
-    echo "$(getprop gsm.sim.operator.alpha) / $(getprop gsm.network.type)" | tee -a "${box_log}" > /dev/null 2>&1
-    echo "$(date)" | tee -a "${box_log}" > /dev/null 2>&1
-    echo "${box_version}" | tee -a "${box_log}" > /dev/null 2>&1
-    echo "--------------------------------------------" | tee -a "${box_log}" > /dev/null 2>&1
+    {
+      echo "$(getprop persist.sys.timezone)"
+      echo "$(getprop gsm.sim.operator.alpha) / $(getprop gsm.network.type)"
+      echo "$(date)"
+      echo "${box_version}"
+      echo "--------------------------------------------"
+    } | tee -a "${box_log}" > /dev/null 2>&1
   fi
 
   # Update iptables if bin_name is still running
@@ -522,8 +549,16 @@ start_box() {
 
   # Checks if bin_name is defined
   case "${bin_name}" in
-    "xray" | "sing-box" | "clash" | "v2fly") log Info "Good day 🐱";;
-    *) log Error "bin_name: <..${bin_name}..> unknown not defined."; exit 1;;
+    clash|xray|sing-box|v2fly)
+      log Info "Good day 🐱"
+      [ "${bin_name}" = "clash" ] && {
+        xclash || exit 1
+      }
+      ;;
+    *)
+      log Error "bin_name: <..${bin_name}..> unknown not defined."
+      exit 1
+      ;;
   esac
 
   # Check permissions, check for bin existence, delete old logs, create a TUN if necessary, run box, and wait for 1 second
@@ -533,11 +568,6 @@ start_box() {
     exit 1
   fi
   box_check_logs
-
-  # Enable IP forwarding
-  if ! sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || ! sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1; then
-    log Debug "can't enable IP forwarding."
-  fi
 
   # Execute the box_create_tun functions
   if [[ "${network_mode}" == "mixed" || "${proxy_mode}" == "tun" ]]; then
@@ -551,16 +581,22 @@ start_box() {
   box_run_bin
   box_cgroup
   # $bin_name detected port
-  if [ "${port_detect}" = "true" ]; then "${scripts_dir}/box.tool" port; else log Info "${bin_name} skipped port detection."; fi
+  if [ "${port_detect}" = "true" ]; then
+    ${scripts_dir}/box.tool port
+  else
+    log Info "${bin_name} skipped port detection."
+  fi
+
   count=0
   while [ $count -le 10 ]; do
-    sleep 0.15
+    sleep 0.17
     box_bin_alive || break
     count=$((count + 1))
   done
   box_bin_status
+
   # open the yacd in browser
-  open_yacd
+  open_dashboard
 }
 
 stop_box() {
@@ -584,14 +620,15 @@ stop_box() {
     if [ -f "${box_pid}" ]; then
       rm -f "${box_pid}"
     fi
-    log Warning "${bin_name} service is stopped."
+    log Warning "${bin_name} shutting down, service is stopped."
     log Warning "${bin_name} disconnected."
     [ -t 1 ] && echo -e "${white}--------------------------------------------${normal}"
   else
     log Warning "${bin_name} Not stopped; may still be shutting down or failed to shut down."
     force_stop
   fi
-  sed -Ei 's/^description=(\[.*][[:space:]]*)?/description=[ 🚫 '${bin_name}' service is stopped ] /g' "$PROPFILE"
+
+  sed -Ei "s/^description=(\[.*][[:space:]]*)?/description=[ ⏲ $current_time | ✘ $bin_name shutting down, service is stopped !!! ] /g" "$PROPFILE"
 }
 
 stop_cron() {
@@ -653,7 +690,7 @@ case "$1" in
       esac
       box_bin_status
     else
-      log Warning "${bin_name} service is stopped."
+      log Warning "${bin_name} shutting down, service is stopped."
     fi
     ;;
   cron)
